@@ -1,14 +1,3 @@
-############################################################
-# FIXED: COMPREHENSIVE THESIS ANALYSIS
-# Key fixes:
-# 1. jointFit is now actually USED in metrics (dynamic predictions, 
-#    joint model C-index, association parameters)
-# 2. Predicted vs observed uses proper median survival, not rank heuristic
-# 3. Method 6B unnest bug fixed
-# 4. Bootstrap R=500
-# 5. TEMPORAL_FEATURES extension bug documented in comments
-############################################################
-
 # ============================================================
 # PACKAGE SETUP
 # ============================================================
@@ -212,9 +201,6 @@ get_median_survival <- function(coxFit, newdata) {
 
 # ============================================================
 # HELPER: EXTRACT JOINT MODEL METRICS
-# FIX: This function is now called inside compute_all_metrics_with_figures
-#      so that the JMBayes2 fit is actually evaluated, not just fitted
-#      and then ignored.
 # ============================================================
 
 extract_joint_metrics <- function(jointFit, surv_data, long_data, method_dir, name) {
@@ -285,8 +271,6 @@ extract_joint_metrics <- function(jointFit, surv_data, long_data, method_dir, na
 
 # ============================================================
 # MAIN METRICS FUNCTION
-# FIX: Now calls extract_joint_metrics so jointFit results
-#      are included in every method's output.
 # ============================================================
 
 compute_all_metrics_with_figures <- function(coxFit, surv_data, long_data,
@@ -588,10 +572,7 @@ compute_all_metrics_with_figures <- function(coxFit, surv_data, long_data,
   }, error = function(e) cat(sprintf("   ⚠ Prediction error: %s\n", e$message)))
   
   # ----------------------------------------------------------
-  # 8. CALIBRATION
-  # ----------------------------------------------------------
-  # ----------------------------------------------------------
-  # 8. CALIBRATION (FIXED)
+  # 8. CALIBRATION 
   # - Predicted survival from actual baseline hazard (not linear rescaling)
   # - Observed survival from KM per group (not binary flag)
   # - Adaptive grouping handles compressed risk score distributions
