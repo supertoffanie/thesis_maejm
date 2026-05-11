@@ -41,7 +41,7 @@ These are fused via **Tensor Fusion** (outer product), producing a `(256+1)×(64
 
 The exported latent features (`z_final`, `z_slope`) are joined with longitudinal MMSE trajectories and fitted using `JMBayes2`:
 
-```
+```r
 lme(MMSE ~ Years_bl + z_feature, random = ~Years_bl | PTID)
 jm(coxFit, lmeFit, functional_forms = ~value(MMSE) + slope(MMSE))
 ```
@@ -54,6 +54,8 @@ This jointly estimates how MMSE trajectory and latent imaging features associate
 
 ```
 .
+├── README.md
+│
 ├── Data/
 │   ├── baseline_clinical_features.csv       # Method 1: age, sex, ADAS13, MMSE
 │   ├── image_only_features.csv              # Method 2: ResNet18 image features
@@ -65,12 +67,8 @@ This jointly estimates how MMSE trajectory and latent imaging features associate
 │   ├── no_ae_patient_level.csv
 │   ├── latent_ae_only.csv                   # Method 6: AE without MTL (per-visit)
 │   ├── ae_only_patient_level.csv
-│   ├── latent_improved_autoencoder.csv      # Method 7: thesis model (per-visit)
-│   ├── latent_patient_level.csv             # Method 7: patient-level summary
-│   ├── latent_improved_autoencoder_V5.csv   # Earlier training runs (versioned)
-│   ├── latent_patient_level_V5.csv
-│   ├── latent_improved_autoencoder_V6.csv
-│   └── latent_patient_level_V6.csv
+│   ├── latent_improved_autoencoder_v6.csv   # Method 7: thesis model (per-visit)
+│   └── latent_patient_level_v6.csv          # Method 7: patient-level summary
 │
 ├── Dataset_Creation_Preprocessing/
 │   ├── Identify_Valid_Patients.ipynb        # Filter ADNI patients with MCI label + imaging
@@ -83,9 +81,11 @@ This jointly estimates how MMSE trajectory and latent imaging features associate
 │   ├── TensorFusion.py                      # Standalone tensor fusion module
 │   └── Thesis_Model.ipynb                   # Full MAE-JM model (main thesis model)
 │
-├── JointModeling_AllMethods.R               # All 7 methods evaluated with JMBayes2
-├── thesis_text.md                           # Thesis write-up
-└── README.md
+├── R/
+│   ├── 01_thesis_model.Rmd                  # Method 7 (MAE-JM): the thesis model
+│   └── 02_comparison_methods.Rmd            # Methods 1–6: baseline and ablation models
+│
+└── thesis_text.md
 ```
 
 ---
@@ -96,9 +96,36 @@ All patient data is sourced from the **Alzheimer's Disease Neuroimaging Initiati
 
 The `Data/` directory contains exported latent features and derived clinical summaries — not raw imaging or clinical records. Raw MRI scans and ADNI tabular data must be downloaded separately and placed at the paths expected by the preprocessing notebooks.
 
+### Required Data Files
+
+All data files must be placed in the `Data/` directory before running the R or Python steps.
+
+**For `01_thesis_model.Rmd` (Method 7 — MAE-JM)**
+
+| File | Description |
+|------|-------------|
+| `latent_patient_level_v6.csv` | Patient-level features (latent z-vectors + survival labels). Must include: `PTID`, `split`, `time_to_event`, `event`, `z_final_*`, `z_slope_*` |
+| `latent_improved_autoencoder_v6.csv` | Longitudinal visit-level data. Must include: `PTID`, `split`, `Years_bl`, `MMSE` |
+
+**For `02_comparison_methods.Rmd` (Methods 1–6)**
+
+| File | Description | Used By |
+|------|-------------|---------|
+| `baseline_clinical_features.csv` | Clinical baseline features + longitudinal MMSE | Method 1 (Clinical Cox) |
+| `image_only_features.csv` | CNN image features per patient | Method 2 (Image-Only) |
+| `tabular_patient_level.csv` | Tabular deep NN patient-level features | Method 3 (Tabular-Only) |
+| `concat_patient_level.csv` | Concatenation fusion patient-level features | Method 4 (Concatenation) |
+| `latent_concat.csv` | Longitudinal data for concatenation model | Method 4 (Concatenation) |
+| `no_ae_patient_level.csv` | No-autoencoder patient-level features | Method 5 (No AE) |
+| `latent_no_ae.csv` | Longitudinal data for no-AE model | Method 5 (No AE) |
+| `ae_only_patient_level.csv` | AE-only (no MTL) patient-level features | Method 6 (AE-Only) |
+| `latent_ae_only.csv` | Longitudinal data for AE-only model | Method 6 (AE-Only) |
+
+> **Note:** All CSVs must contain a `split` column with values `"train"` and `"val"`. If missing, re-export from the Python pipeline.
+
 ### Feature Schema
 
-**Per-visit CSVs** (`latent_improved_autoencoder.csv`, etc.) contain:
+**Per-visit CSVs** (`latent_improved_autoencoder_v6.csv`, etc.) contain:
 
 | Column | Description |
 |---|---|
@@ -110,7 +137,7 @@ The `Data/` directory contains exported latent features and derived clinical sum
 | `split` | `train` or `val` |
 | `z_0` … `z_127` | 128-dim latent visit embedding |
 
-**Patient-level CSVs** (`latent_patient_level.csv`, etc.) additionally contain:
+**Patient-level CSVs** (`latent_patient_level_v6.csv`, etc.) additionally contain:
 
 | Column | Description |
 |---|---|
@@ -147,7 +174,7 @@ pip install torch torchvision pandas numpy scikit-learn lifelines Pillow
 install.packages(c(
   "JMbayes2", "nlme", "survival", "survRM2", "boot",
   "pec", "survminer", "glmnet", "ggplot2", "gridExtra",
-  "dplyr", "tidyr", "e1071", "scales"
+  "dplyr", "tidyr", "e1071", "scales", "knitr", "rmarkdown"
 ))
 ```
 
@@ -161,7 +188,7 @@ Run `Identify_Valid_Patients.ipynb` to produce `VALID_PATIENTS.pkl`, which filte
 
 ### Step 2 — Build ablation CSVs
 
-Run the following notebooks in order to produce input CSVs for each method:
+Run the following notebooks in order to produce input CSVs for each comparison method:
 
 ```
 AD_Baseline.ipynb          → baseline_clinical_features.csv
@@ -177,8 +204,8 @@ Tensor_Fusion_Only.ipynb   → latent_no_ae.csv, no_ae_patient_level.csv
 Run `Thesis_Model.ipynb` (or `TensorFusion.py` directly). This trains the full MAE-JM model and exports:
 
 ```
-latent_improved_autoencoder.csv   ← per-visit latent features (train + val)
-latent_patient_level.csv          ← patient-level features (train + val)
+Data/latent_improved_autoencoder_v6.csv   ← per-visit latent features (train + val)
+Data/latent_patient_level_v6.csv          ← patient-level features (train + val)
 ```
 
 Key config options at the top of the script:
@@ -194,19 +221,42 @@ CONFIG = {
 }
 ```
 
-> **Note on MTL loss scaling**: MMSE MSE loss is numerically much larger than Cox loss (~200 vs ~1.5 at convergence). Consider normalizing MMSE targets to zero mean / unit variance or reducing `alpha_mmse` to ~0.05 to better balance the two signals.
+> **Note on MTL loss scaling:** MMSE MSE loss is numerically much larger than Cox loss (~200 vs ~1.5 at convergence). Consider normalizing MMSE targets to zero mean / unit variance or reducing `alpha_mmse` to ~0.05 to better balance the two signals.
 
-### Step 4 — Run joint modeling in R
+### Step 4 — Run the thesis joint model (Method 7)
+
+Open `R/01_thesis_model.Rmd` in RStudio and click **Knit**, or run:
 
 ```r
-source("JointModeling_AllMethods.R")
+rmarkdown::render("R/01_thesis_model.Rmd")
 ```
 
-This script reads all `Data/` CSVs, fits Cox + LME + joint models for all 7 methods, and saves results to `thesis_figures/`:
+This produces:
+- An HTML report with embedded output
+- All figures saved to `thesis_figures/MSTE-JM/`
+- A results CSV at `thesis_figures/ALL_METHODS_RESULTS.csv`
 
-- `FINAL_COMPARISON.csv` — full metric table
-- `PUBLICATION_TABLE.csv` — formatted for thesis/paper
-- Per-method subdirectories with KM plots, calibration curves, forest plots, and joint model survival curves
+> **Runtime:** Method 7 runs MCMC via `JMbayes2` (2 chains × 10,000 iterations). Expect ~20–40 minutes depending on your machine. All random seeds are set to `42`; results may vary slightly across machines due to floating-point differences in MCMC.
+
+### Step 5 — Run comparison methods in R *(optional)*
+
+```r
+rmarkdown::render("R/02_comparison_methods.Rmd")
+```
+
+---
+
+## Figures (Joint Modeling Chapter)
+
+All figures are saved to `thesis_figures/MSTE-JM/` after running `01_thesis_model.Rmd`.
+
+| Figure File | Thesis Reference | Generated By |
+|-------------|-----------------|--------------|
+| `MSTE-JM_jm_survival_curves.png` | Joint model predicted survival curves (converter vs. non-converter) | Section 4 — `plot_joint_model_survival_curves()` |
+| `MSTE-JM_baseline_survival.png` | Baseline survival function from Cox sub-model | Section 3 — `basehaz()` plot |
+| `MSTE-JM_KM_stratified.png` | Kaplan-Meier curves stratified by predicted risk group | Section 5 — `ggsurvplot()` |
+| `MSTE-JM_brier_scores.png` | Brier score at 1, 3, 5 years | Section 4 — `pec()` |
+| `MSTE-JM_predicted_vs_observed.png` | Predicted vs. observed conversion time (converters only) | Section 7 — `get_median_survival()` |
 
 ---
 
