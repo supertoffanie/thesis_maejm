@@ -1,0 +1,786 @@
+---
+title: "Comparison Methods (Methods 1–6)"
+author: "Tiffany"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 6
+)
+```
+
+# Overview
+
+This notebook runs Methods 1–6 used as baselines and ablations in the thesis.
+
+| Method | Name | Input File(s) |
+|--------|------|---------------|
+| 1 | Clinical Cox (baseline) | `baseline_clinical_features.csv` |
+| 2 | Image-Only CNN | `image_only_features.csv` |
+| 3 | Tabular-Only Deep NN | `tabular_patient_level.csv` |
+| 4 | Concatenation Fusion | `concat_patient_level.csv`, `latent_concat.csv` |
+| 5 | No Autoencoder | `no_ae_patient_level.csv`, `latent_no_ae.csv` |
+| 6 | AE-Only (No MTL) | `ae_only_patient_level.csv`, `latent_ae_only.csv` |
+
+Figures are saved to `thesis_figures/<method_name>/`.
+
+---
+
+# 1. Setup
+
+```{r packages}
+required_packages <- c(
+  "survRM2", "boot", "JMbayes2", "dplyr", "nlme",
+  "survival", "pec", "survminer", "ggplot2", "gridExtra",
+  "tidyr", "glmnet", "e1071", "scales"
+)
+for (pkg in required_packages) {
+  if (!require(pkg, character.only=TRUE, quietly=TRUE)) {
+    install.packages(pkg, repos="http://cran.r-project.org")
+    library(pkg, character.only=TRUE)
+  }
+}
+select    <- dplyr::select
+summarize <- dplyr::summarize
+if (!dir.exists("thesis_figures")) dir.create("thesis_figures")
+cat("Setup complete.\n")
+```
+
+---
+
+# 2. Shared Helpers
+
+These are the same utilities used in `01_thesis_model.Rmd`. They must be run
+before any method section below.
+
+```{r helpers}
+safe_cv_glmnet <- function(x_mat, y_mat, alpha=0.5) {
+  n <- nrow(x_mat)
+  if (n < 5) { cat(sprintf("  WARNING: Only %d patients\n", n)); return(NULL) }
+  nfolds <- min(10L, n)
+  tryCatch(
+    cv.glmnet(x_mat, y_mat, family="cox", alpha=alpha, nfolds=nfolds, type.measure="C"),
+    error=function(e) { cat(sprintf("  WARNING: cv.glmnet failed (%s)\n", e$message)); NULL }
+  )
+}
+
+cap_features_by_epe <- function(sel, events, epe=10) {
+  sel <- as.character(sel); events <- as.integer(events)
+  max_f <- max(1L, floor(events/epe))
+  if (length(sel) > max_f) { sel <- sel[seq_len(max_f)] }
+  sel
+}
+
+standardise_features <- function(train_df, test_df, feat_cols) {
+  feat_cols <- intersect(feat_cols, intersect(names(train_df), names(test_df)))
+  for (f in feat_cols) {
+    train_df[[f]] <- as.numeric(train_df[[f]]); test_df[[f]] <- as.numeric(test_df[[f]])
+    m <- mean(train_df[[f]], na.rm=TRUE); s <- sd(train_df[[f]], na.rm=TRUE)
+    if (!is.na(s) && s > 1e-10) {
+      train_df[[f]] <- pmin(pmax((train_df[[f]]-m)/s,-5),5)
+      test_df[[f]]  <- pmin(pmax((test_df[[f]]-m)/s,-5),5)
+    } else { train_df[[f]] <- 0.0; test_df[[f]] <- 0.0 }
+  }
+  list(train=train_df, test=test_df)
+}
+
+select_features <- function(train_df, all_cols, n_events, method_name="") {
+  all_cols <- intersect(all_cols, names(train_df))
+  ok_var   <- sapply(all_cols, function(f) { v <- var(as.numeric(train_df[[f]]),na.rm=TRUE); !is.na(v) && v > 1e-10 })
+  all_cols <- all_cols[ok_var]
+  if (length(all_cols) == 0) return(character(0))
+
+  x_mat  <- as.matrix(train_df[,all_cols,drop=FALSE])
+  y_mat  <- Surv(train_df$time, train_df$event)
+  cv_fit <- safe_cv_glmnet(x_mat, y_mat)
+  sel    <- character(0)
+  if (!is.null(cv_fit)) {
+    coefs <- coef(cv_fit, s=cv_fit$lambda.1se); sel <- all_cols[which(coefs!=0)]
+    if (length(sel) < 5) { coefs <- coef(cv_fit, s=cv_fit$lambda.min); sel <- all_cols[which(coefs!=0)] }
+  }
+  if (length(sel) < 5) {
+    uni_c   <- sapply(all_cols, function(f) tryCatch(
+      summary(coxph(as.formula(paste("Surv(time,event) ~",f)),data=train_df))$concordance[1],
+      error=function(e) 0.5))
+    top_idx <- order(uni_c,decreasing=TRUE)[seq_len(min(10L,length(all_cols)))]
+    sel     <- all_cols[top_idx]
+  }
+  sel <- cap_features_by_epe(sel, n_events)
+  if (length(sel) > 1) {
+    test_cox <- tryCatch(
+      coxph(as.formula(paste("Surv(time,event) ~",paste(sel,collapse=" + "))),
+            data=train_df, x=FALSE, control=coxph.control(iter.max=30)),
+      error=function(e) NULL)
+    if (!is.null(test_cox)) {
+      cv <- tryCatch(coef(test_cox),error=function(e) NULL)
+      if (!is.null(cv) && any(!is.finite(cv))) {
+        uni_c2 <- sapply(sel,function(f) tryCatch(
+          summary(coxph(as.formula(paste("Surv(time,event) ~",f)),data=train_df))$concordance[1],
+          error=function(e) 0.5))
+        sel <- sel[which.max(uni_c2)]
+      }
+    }
+  }
+  cat(sprintf("  Selected %d features\n", length(sel))); sel
+}
+
+fit_ridge_cox <- function(train_df, sel, method_name="") {
+  x_mat  <- as.matrix(train_df[,sel,drop=FALSE])
+  y_mat  <- Surv(train_df$time, train_df$event)
+  nfolds <- min(10L, nrow(x_mat))
+  lambda_grid <- exp(seq(log(0.001),log(10),length.out=100))
+  cv_ridge <- tryCatch(
+    cv.glmnet(x_mat,y_mat,family="cox",alpha=0,lambda=lambda_grid,nfolds=nfolds,type.measure="C"),
+    error=function(e) NULL)
+  if (is.null(cv_ridge))
+    return(coxph(as.formula(paste("Surv(time,event) ~",paste(sel,collapse=" + "))),
+                 data=train_df, x=TRUE, method="breslow"))
+  ridge_coefs <- as.numeric(coef(cv_ridge, s=cv_ridge$lambda.min)); names(ridge_coefs) <- sel
+  if (max(abs(ridge_coefs)) < 0.001) {
+    best_lambda <- cv_ridge$lambda[which.max(cv_ridge$cvm)]
+    ridge_coefs <- as.numeric(coef(cv_ridge,s=best_lambda)); names(ridge_coefs) <- sel
+  }
+  tryCatch(
+    coxph(as.formula(paste("Surv(time,event) ~",paste(sel,collapse=" + "))),
+          data=train_df, x=TRUE, method="breslow",
+          init=ridge_coefs, control=coxph.control(iter.max=0)),
+    error=function(e)
+      coxph(as.formula(paste("Surv(time,event) ~",paste(sel,collapse=" + "))),
+            data=train_df, x=TRUE, method="breslow")
+  )
+}
+
+get_median_survival <- function(coxFit, newdata) {
+  bh <- basehaz(coxFit, centered=FALSE); lp <- predict(coxFit, newdata=newdata, type="lp")
+  obs_cap <- quantile(newdata$time, 0.95, na.rm=TRUE)
+  sapply(lp, function(l) {
+    surv_i <- exp(-bh$hazard*exp(l)); idx <- which(surv_i <= 0.5)
+    if (length(idx) > 0) min(bh$time[min(idx)], obs_cap)
+    else min(bh$time[which.min(surv_i)], obs_cap)
+  })
+}
+
+safe_lme <- function(formula, data, random_slope=TRUE) {
+  ctrl <- lmeControl(opt="optim", maxIter=500, returnObject=FALSE)
+  if (random_slope) {
+    tryCatch(lme(formula, random=~Years_bl|PTID, data=data, control=ctrl),
+             error=function(e) {
+               cat(sprintf("  WARNING: Random-slope LME failed — intercept-only\n"))
+               tryCatch(lme(formula, random=~1|PTID, data=data, control=ctrl),
+                        error=function(e2) stop(sprintf("LME failed: %s", e2$message)))
+             })
+  } else {
+    lme(formula, random=~1|PTID, data=data, control=ctrl)
+  }
+}
+
+safe_jm <- function(cox_fit, lme_fit, time_var="Years_bl", seed=42, method_name="") {
+  cat("  Fitting JM (value+slope)...\n")
+  jm1 <- tryCatch(
+    jm(cox_fit, lme_fit, time_var=time_var,
+       functional_forms=~value(MMSE)+slope(MMSE),
+       n_iter=10000, n_burnin=2000, n_thin=5, n_chains=2, seed=seed),
+    error=function(e) { cat(sprintf("  WARNING: JM value+slope failed — trying value-only\n")); NULL }
+  )
+  if (!is.null(jm1)) { cat("  JM converged (value+slope)\n"); return(jm1) }
+  jm2 <- tryCatch(
+    jm(cox_fit, lme_fit, time_var=time_var,
+       functional_forms=~value(MMSE),
+       n_iter=7000, n_burnin=1500, n_thin=5, n_chains=2, seed=seed),
+    error=function(e) { cat(sprintf("  WARNING: JM value-only also failed\n")); NULL }
+  )
+  if (!is.null(jm2)) cat("  JM converged (value-only)\n")
+  jm2
+}
+
+extract_jm_association <- function(jointFit, method_dir, name) {
+  res <- list(jm_association_val=NA, jm_association_val_lower=NA, jm_association_val_upper=NA,
+              jm_association_slope=NA, jm_association_slope_lower=NA, jm_association_slope_upper=NA)
+  if (is.null(jointFit)) return(res)
+  sm <- tryCatch(summary(jointFit),error=function(e) NULL); if (is.null(sm)) return(res)
+  tbl <- tryCatch(as.data.frame(sm$Survival),error=function(e) NULL); if (is.null(tbl)) return(res)
+  cn <- colnames(tbl)
+  mean_col  <- cn[grep("^[Mm]ean$|^[Ee]stimate$",cn)][1]
+  lower_col <- cn[grep("2\\.5|[Ll]ower",cn)][1]
+  upper_col <- cn[grep("97\\.5|[Uu]pper",cn)][1]
+  rn <- rownames(tbl)
+  vi <- grep("value|Assoct$",rn,ignore.case=TRUE)
+  if (length(vi)>0) {
+    res$jm_association_val       <- as.numeric(tbl[vi[1],mean_col])
+    res$jm_association_val_lower <- as.numeric(tbl[vi[1],lower_col])
+    res$jm_association_val_upper <- as.numeric(tbl[vi[1],upper_col])
+  }
+  si <- grep("slope|Assoct_slope",rn,ignore.case=TRUE)
+  if (length(si)>0) {
+    res$jm_association_slope       <- as.numeric(tbl[si[1],mean_col])
+    res$jm_association_slope_lower <- as.numeric(tbl[si[1],lower_col])
+    res$jm_association_slope_upper <- as.numeric(tbl[si[1],upper_col])
+  }
+  write.csv(tbl, file.path(method_dir, paste0(gsub(" ","_",name),"_jm_association.csv")), row.names=TRUE)
+  res
+}
+
+compute_dynamic_auc <- function(jointFit, long_data, surv_data, patient_level_data,
+                                cox_vars, method_dir, name, min_events_for_auc=4) {
+  res_auc <- NA
+  if (is.null(jointFit) || is.null(long_data) || nrow(long_data)==0) return(res_auc)
+  long_data$PTID <- as.character(long_data$PTID)
+  long_data$Years_bl <- as.numeric(long_data$Years_bl)
+  long_data$MMSE <- as.numeric(long_data$MMSE)
+  surv_data$PTID <- as.character(surv_data$PTID)
+  max_obs <- max(surv_data$time,na.rm=TRUE)
+  landmarks <- c(0.5,1,1.5,2)[c(0.5,1,1.5,2) < max_obs*0.80]
+  cox_vars_detected <- tryCatch({
+    f <- jointFit$model_info$terms_Surv_noResp
+    if (!is.null(f)) setdiff(all.vars(f),c("time","event","PTID","Years_bl","MMSE")) else character(0)
+  }, error=function(e) character(0))
+  if (length(cox_vars_detected)==0) cox_vars_detected <- cox_vars
+  surv_outcome <- surv_data %>% select(PTID,time,event)
+  aucs <- c(); used_landmarks <- c()
+  for (t0 in landmarks) {
+    tryCatch({
+      at_risk_ids <- surv_outcome$PTID[surv_outcome$time > t0]
+      if (length(at_risk_ids) < 5) next
+      long_t0 <- long_data %>% filter(PTID %in% at_risk_ids, Years_bl <= t0+1e-6) %>%
+        left_join(surv_outcome, by="PTID")
+      if (length(cox_vars_detected)>0 && !is.null(patient_level_data)) {
+        missing_cox <- setdiff(cox_vars_detected, names(long_t0))
+        if (length(missing_cox)>0) {
+          avail <- intersect(c("PTID",missing_cox),names(patient_level_data))
+          if (length(avail)>1)
+            long_t0 <- long_t0 %>%
+              left_join(patient_level_data %>% select(all_of(avail)) %>% distinct(PTID,.keep_all=TRUE), by="PTID")
+        }
+      }
+      long_t0 <- long_t0[complete.cases(long_t0[,intersect(c("PTID","Years_bl","MMSE","time","event"),names(long_t0))]),]
+      n_pts_t0 <- length(unique(long_t0$PTID))
+      n_evt_t0 <- sum(surv_outcome$event==1 & surv_outcome$time>t0 &
+                        surv_outcome$time<=(t0+1.5) & surv_outcome$PTID %in% unique(long_t0$PTID))
+      if (n_pts_t0<5 || n_evt_t0<min_events_for_auc) next
+      auc_obj <- tvAUC(jointFit, newdata=long_t0, Tstart=t0, Dt=1.5)
+      aucs <- c(aucs, auc_obj$auc); used_landmarks <- c(used_landmarks, t0)
+      cat(sprintf("    Dynamic AUC at t=%.1f: %.4f\n", t0, auc_obj$auc))
+    }, error=function(e) cat(sprintf("    WARNING: tvAUC at t=%.1f failed: %s\n", t0, trimws(e$message))))
+  }
+  if (length(aucs)>0) {
+    res_auc <- mean(aucs,na.rm=TRUE)
+    write.csv(data.frame(Landmark=used_landmarks, AUC=aucs),
+              file.path(method_dir, paste0(gsub(" ","_",name),"_dynamic_auc.csv")), row.names=FALSE)
+  }
+  res_auc
+}
+
+# Helper: read patient-level CSV and return train/test splits
+build_split_surv <- function(pl_csv, z_final_pat="^z_final_", z_slope_pat="^z_slope_",
+                             extra_surv_cols=character(0), method_name="") {
+  if (!file.exists(pl_csv)) stop(sprintf("File not found: %s", pl_csv))
+  pl <- read.csv(pl_csv, stringsAsFactors=FALSE)
+  pl$PTID <- as.character(pl$PTID)
+  if (!"split" %in% names(pl)) stop(sprintf("No 'split' column in %s", pl_csv))
+  zf <- grep(z_final_pat, names(pl), value=TRUE)
+  zs <- grep(z_slope_pat, names(pl), value=TRUE)
+  all_cols <- intersect(c(zf,zs,extra_surv_cols), names(pl))
+  surv_full <- pl %>%
+    select(PTID, split, time_to_event, event, all_of(all_cols)) %>%
+    filter(!is.na(time_to_event), !is.na(event), time_to_event>0) %>%
+    rename(time=time_to_event)
+  surv_full <- surv_full[complete.cases(surv_full),]
+  train_raw <- surv_full %>% filter(split=="train")
+  test_raw  <- surv_full %>% filter(split=="val")
+  std <- standardise_features(train_raw, test_raw, all_cols)
+  list(train=std$train, test=std$test, all_cols=all_cols, zf=zf, zs=zs, pl=pl)
+}
+
+# Master evaluation (metrics + figures)
+compute_all_metrics_with_figures <- function(coxFit, surv_data, long_data,
+                                             jointFit=NULL, name="Method",
+                                             patient_level_data=NULL,
+                                             cox_vars_hint=character(0)) {
+  cat(sprintf("\n=== EVALUATING: %s ===\n", name))
+  n_pts    <- length(unique(surv_data$PTID))
+  n_events <- sum(surv_data$event)
+  method_dir <- file.path("thesis_figures", gsub("[^A-Za-z0-9_-]","_",name))
+  if (!dir.exists(method_dir)) dir.create(method_dir, recursive=TRUE)
+
+  res <- list(
+    name=name, n_patients=n_pts, n_events=n_events, event_rate=n_events/n_pts,
+    cindex=NA, cindex_ci_lower=NA, cindex_ci_upper=NA,
+    brier_1yr=NA, brier_3yr=NA, brier_5yr=NA,
+    calibration_slope=NA, calibration_intercept=NA,
+    rmst_tau=NA, rmst_low=NA, rmst_low_lower=NA, rmst_low_upper=NA,
+    rmst_high=NA, rmst_high_lower=NA, rmst_high_upper=NA,
+    rmst_diff=NA, rmst_diff_lower=NA, rmst_diff_upper=NA, rmst_pval=NA,
+    mae_time=NA, rmse_time=NA, corr_time=NA, median_error=NA,
+    n_significant=NA, km_high_median=NA, km_low_median=NA,
+    jm_association_val=NA, jm_association_val_lower=NA, jm_association_val_upper=NA,
+    jm_association_slope=NA, jm_association_slope_lower=NA, jm_association_slope_upper=NA,
+    jm_dynamic_auc=NA
+  )
+
+  res$cindex <- summary(coxFit)$concordance[1]
+  cat(sprintf("C-index: %.4f\n", res$cindex))
+
+  tryCatch({
+    cf <- as.data.frame(summary(coxFit)$coefficients)
+    cf$Variable <- rownames(cf); cf$HR <- exp(cf$coef)
+    cf$HR_lower <- exp(cf$coef-1.96*cf$`se(coef)`); cf$HR_upper <- exp(cf$coef+1.96*cf$`se(coef)`)
+    write.csv(cf, file.path(method_dir,paste0(gsub(" ","_",name),"_cox_coefficients.csv")), row.names=FALSE)
+    res$n_significant <- sum(cf$`Pr(>|z|)` < 0.10)
+    sig <- cf[cf$`Pr(>|z|)` < 0.10,]
+    if (nrow(sig)>0 && nrow(sig)<=25) {
+      sig$HR_plot <- pmin(pmax(sig$HR,0.001),1000)
+      sig$HR_lower_plot <- pmin(pmax(sig$HR_lower,0.001),1000)
+      sig$HR_upper_plot <- pmin(pmax(sig$HR_upper,0.001),1000)
+      fp <- ggplot(sig,aes(x=HR_plot,y=reorder(Variable,HR_plot))) +
+        geom_vline(xintercept=1,linetype="dashed",color="gray50",linewidth=0.8) +
+        geom_errorbarh(aes(xmin=HR_lower_plot,xmax=HR_upper_plot),height=0.2,linewidth=0.6) +
+        geom_point(size=3,color="#0072B2") + scale_x_log10() +
+        labs(title=paste("Hazard Ratios:",name),x="HR (log scale)",y="") + theme_minimal(base_size=13)
+      ggsave(file.path(method_dir,paste0(gsub(" ","_",name),"_forest_plot.png")),
+             fp, width=10, height=max(5,nrow(sig)*0.35), dpi=300)
+    }
+  }, error=function(e) cat(sprintf("WARNING (Cox coef): %s\n",e$message)))
+
+  tryCatch({
+    bsf <- basehaz(coxFit,centered=TRUE); bsf$surv_prob <- exp(-bsf$hazard)
+    ggsave(file.path(method_dir,paste0(gsub(" ","_",name),"_baseline_survival.png")),
+           ggplot(bsf,aes(time,surv_prob))+geom_step(color="#0072B2",linewidth=1.2)+ylim(0,1)+
+             labs(title=paste("Baseline Survival:",name),x="Time (Years)",y="Survival Prob.")+theme_minimal(base_size=13),
+           width=8,height=6,dpi=300)
+  }, error=function(e) cat(sprintf("WARNING (baseline): %s\n",e$message)))
+
+  tryCatch({
+    if (n_pts<10) stop("too few patients")
+    pec_obj <- pec(list("Model"=coxFit),formula=Surv(time,event)~1,data=surv_data,
+                   times=c(1,3,5),exact=FALSE,cens.model="marginal",verbose=FALSE)
+    bs <- pec_obj$AppErr$Model
+    res$brier_1yr <- bs[1]; res$brier_3yr <- bs[2]; res$brier_5yr <- bs[3]
+    cat(sprintf("Brier — 1yr: %.4f | 3yr: %.4f | 5yr: %.4f\n",bs[1],bs[2],bs[3]))
+    ggsave(file.path(method_dir,paste0(gsub(" ","_",name),"_brier_scores.png")),
+           ggplot(data.frame(Time=c(1,3,5),Brier=bs),aes(Time,Brier))+
+             geom_line(color="#0072B2",linewidth=1.3)+geom_point(size=4,color="#0072B2")+
+             geom_hline(yintercept=0.10,linetype="dashed",color="darkgreen")+
+             labs(title=paste("Brier Score:",name),x="Time (Years)",y="Brier Score")+theme_minimal(base_size=13),
+           width=8,height=6,dpi=300)
+  }, error=function(e) cat(sprintf("WARNING (Brier): %s\n",e$message)))
+
+  tryCatch({
+    surv_data$risk <- predict(coxFit,newdata=surv_data,type="lp")
+    surv_data$risk_group <- ifelse(surv_data$risk>=median(surv_data$risk),"High Risk","Low Risk")
+    fs  <- survfit(Surv(time,event)~risk_group,data=surv_data)
+    kmp <- ggsurvplot(fs,data=surv_data,risk.table=TRUE,pval=TRUE,conf.int=TRUE,
+                      palette=c("#D55E00","#0072B2"),linetype=c("solid","dashed"),
+                      legend.title="Risk Group",title=paste("Kaplan-Meier:",name),
+                      xlab="Time (Years)",ylab="Progression-Free Probability")
+    ggsave(file.path(method_dir,paste0(gsub(" ","_",name),"_KM_stratified.png")),
+           kmp$plot,width=10,height=8,dpi=300)
+    kt <- summary(fs)$table
+    res$km_high_median <- kt["risk_group=High Risk","median"]
+    res$km_low_median  <- kt["risk_group=Low Risk","median"]
+    cat(sprintf("KM median — High: %.2f yr | Low: %.2f yr\n",res$km_high_median,res$km_low_median))
+    surv_data$arm <- as.numeric(surv_data$risk_group=="Low Risk")
+    tau <- min(max(surv_data$time[surv_data$risk_group=="High Risk"],na.rm=TRUE),
+               max(surv_data$time[surv_data$risk_group=="Low Risk"],na.rm=TRUE)) * 0.9
+    rr  <- rmst2(surv_data$time,surv_data$event,surv_data$arm,tau=tau)
+    res$rmst_tau  <- tau; res$rmst_low <- rr$RMST.arm1$rmst["Est."]
+    res$rmst_high <- rr$RMST.arm0$rmst["Est."]; res$rmst_diff <- rr$unadjusted.result[1,"Est."]
+    res$rmst_pval <- rr$unadjusted.result[1,"p"]
+    cat(sprintf("RMST diff: %.3f yr (p=%.4f)\n",res$rmst_diff,res$rmst_pval))
+  }, error=function(e) cat(sprintf("WARNING (KM/RMST): %s\n",e$message)))
+
+  tryCatch({
+    conv <- surv_data[surv_data$event==1,]; if (nrow(conv)<5) stop("too few converters")
+    pred <- get_median_survival(coxFit,conv); obs <- conv$time; err <- abs(pred-obs)
+    res$mae_time <- mean(err); res$rmse_time <- sqrt(mean((pred-obs)^2))
+    res$corr_time <- cor(pred,obs,method="pearson"); res$median_error <- median(err)
+    cat(sprintf("MAE: %.3f yr | RMSE: %.3f yr | r: %.3f\n",res$mae_time,res$rmse_time,res$corr_time))
+    pod <- data.frame(Predicted=pred,Observed=obs,PTID=conv$PTID,Error=err)
+    ggsave(file.path(method_dir,paste0(gsub(" ","_",name),"_predicted_vs_observed.png")),
+           ggplot(pod,aes(Observed,Predicted))+
+             geom_abline(intercept=0,slope=1,linetype="dashed",color="gray40")+
+             geom_point(alpha=0.7,size=3.5,color="#0072B2")+
+             geom_smooth(method="lm",se=TRUE,color="#D55E00",alpha=0.2)+
+             labs(title=paste("Predicted vs Observed:",name),x="Observed (Years)",y="Predicted (Years)")+
+             theme_minimal(base_size=13)+coord_equal(),
+           width=8,height=8,dpi=300)
+  }, error=function(e) cat(sprintf("WARNING (pred vs obs): %s\n",e$message)))
+
+  tryCatch({
+    if (n_pts<20) stop("too few patients")
+    boot_pred_cols <- names(coef(coxFit))
+    boot_formula   <- as.formula(paste("Surv(time,event) ~",paste(boot_pred_cols,collapse=" + ")))
+    boot_count <- 0L
+    boot_fn <- function(data,idx) {
+      boot_count <<- boot_count+1L
+      if (boot_count %% 50==0) cat(sprintf("  Bootstrap rep %d/200...\n",boot_count))
+      bd <- data[idx,]
+      bfx <- tryCatch(coxph(boot_formula,data=bd,x=TRUE,control=coxph.control(iter.max=100)),error=function(e) NULL)
+      if (is.null(bfx)) return(NA_real_)
+      cv <- tryCatch(coef(bfx),error=function(e) NULL)
+      if (!is.null(cv) && any(!is.finite(cv))) return(NA_real_)
+      summary(bfx)$concordance[1]
+    }
+    br  <- boot(data=surv_data,statistic=boot_fn,R=200)
+    vld <- br$t[!is.na(br$t) & br$t<1.0]
+    if (length(vld)>=50) {
+      res$cindex_ci_lower <- quantile(vld,0.025); res$cindex_ci_upper <- quantile(vld,0.975)
+    } else if (length(vld)>=10) {
+      se_boot <- sd(vld)
+      res$cindex_ci_lower <- res$cindex-1.96*se_boot; res$cindex_ci_upper <- res$cindex+1.96*se_boot
+    }
+    saveRDS(br, file.path(method_dir,paste0(gsub(" ","_",name),"_bootstrap.rds")))
+  }, error=function(e) cat(sprintf("WARNING (bootstrap): %s\n",e$message)))
+
+  if (!is.null(jointFit)) {
+    jm_assoc <- extract_jm_association(jointFit, method_dir, name)
+    res[names(jm_assoc)] <- jm_assoc
+    res$jm_dynamic_auc <- compute_dynamic_auc(
+      jointFit, long_data, surv_data, patient_level_data, cox_vars_hint, method_dir, name)
+  }
+
+  rdf <- as.data.frame(res, stringsAsFactors=FALSE)
+  mf  <- "thesis_figures/ALL_METHODS_RESULTS.csv"
+  if (file.exists(mf)) {
+    ex <- read.csv(mf,stringsAsFactors=FALSE)
+    ac <- union(names(ex),names(rdf))
+    for (col in setdiff(ac,names(ex)))  ex[[col]]  <- NA
+    for (col in setdiff(ac,names(rdf))) rdf[[col]] <- NA
+    rdf <- rbind(ex[,ac],rdf[,ac])
+  }
+  write.csv(rdf,mf,row.names=FALSE)
+
+  cat(sprintf("\n--- SUMMARY: %s ---\n", name))
+  cat(sprintf("C-index: %.4f", res$cindex))
+  if (!is.na(res$cindex_ci_lower)) cat(sprintf(" (%.4f, %.4f)",res$cindex_ci_lower,res$cindex_ci_upper))
+  cat("\n")
+  if (!is.na(res$brier_3yr))         cat(sprintf("Brier 3yr:  %.4f\n",res$brier_3yr))
+  if (!is.na(res$calibration_slope)) cat(sprintf("Cal slope:  %.3f\n",res$calibration_slope))
+  if (!is.na(res$rmst_diff))         cat(sprintf("RMST diff:  %.3f yr (p=%.4f)\n",res$rmst_diff,res$rmst_pval))
+  if (!is.na(res$mae_time))          cat(sprintf("MAE:        %.3f yr\n",res$mae_time))
+  return(res)
+}
+```
+
+---
+
+# 3. Method 1: Clinical Cox (Baseline)
+
+> **Input:** `baseline_clinical_features.csv`
+> **Features:** AGE, PTGENDER, PTEDUCAT, ADAS13 + longitudinal MMSE (joint model)
+
+```{r method1}
+metrics_baseline <- NULL
+tryCatch({
+  if (!file.exists("baseline_clinical_features.csv")) stop("File not found")
+  dat <- read.csv("baseline_clinical_features.csv", stringsAsFactors=FALSE)
+  dat$PTID <- as.character(dat$PTID)
+  if (!"split" %in% names(dat)) stop("No 'split' column")
+
+  long_full <- dat %>%
+    filter(!is.na(MMSE),!is.na(Years_bl)) %>%
+    select(PTID,split,Years_bl,MMSE,ADAS13,AGE,PTGENDER,PTEDUCAT) %>%
+    arrange(PTID,Years_bl) %>% filter(complete.cases(.))
+
+  surv_full <- dat %>%
+    group_by(PTID) %>%
+    summarize(time=first(time_to_event),event=first(event),AGE=first(AGE),
+              PTGENDER=first(PTGENDER),PTEDUCAT=first(PTEDUCAT),ADAS13=first(ADAS13),
+              split=first(split),.groups="drop") %>% filter(complete.cases(.))
+
+  surv_train <- surv_full %>% filter(split=="train")
+  surv_test  <- surv_full %>% filter(split=="val")
+  long_train <- long_full %>% filter(PTID %in% surv_train$PTID)
+  long_test  <- long_full %>% filter(PTID %in% surv_test$PTID)
+
+  # Remove patients with only one visit
+  single_v <- long_train %>% group_by(PTID) %>% filter(n()<2) %>% pull(PTID) %>% unique()
+  long_train <- long_train %>% filter(!PTID %in% single_v)
+  surv_train <- surv_train %>% filter(PTID %in% intersect(surv_train$PTID, long_train$PTID))
+  long_train <- long_train %>% filter(PTID %in% surv_train$PTID)
+
+  cat(sprintf("Train: %d patients, %d events\n", nrow(surv_train), sum(surv_train$event)))
+  cat(sprintf("Test:  %d patients, %d events\n", nrow(surv_test),  sum(surv_test$event)))
+
+  lmeFit_baseline <- safe_lme(MMSE~Years_bl+AGE+PTGENDER+PTEDUCAT+ADAS13, data=long_train)
+  coxFit_baseline <- coxph(Surv(time,event)~AGE+PTGENDER+PTEDUCAT+ADAS13,
+                           data=surv_train, x=TRUE, ties="breslow")
+  cat(sprintf("Train C-index: %.4f\n", summary(coxFit_baseline)$concordance[1]))
+
+  jointFit_baseline <- safe_jm(coxFit_baseline, lmeFit_baseline, method_name="Clinical Cox")
+
+  metrics_baseline <- compute_all_metrics_with_figures(
+    coxFit_baseline, surv_test, long_test, jointFit_baseline,
+    "Clinical Cox", patient_level_data=surv_test
+  )
+}, error=function(e) cat(sprintf("ERROR in Method 1: %s\n", e$message)))
+```
+
+---
+
+# 4. Method 2: Image-Only CNN
+
+> **Input:** `image_only_features.csv`
+> **Features:** CNN image embeddings (`img_feat_*` or `z_*`)
+
+```{r method2}
+metrics_image <- NULL
+tryCatch({
+  if (!file.exists("image_only_features.csv")) stop("File not found")
+  dat <- read.csv("image_only_features.csv", stringsAsFactors=FALSE)
+  dat$PTID <- as.character(dat$PTID)
+  img_features <- grep("^img_feat_|^z_", names(dat), value=TRUE)
+  if (length(img_features)==0) stop("No image features found")
+
+  surv_full <- dat %>%
+    group_by(PTID) %>%
+    summarize(time=first(time_to_event),event=first(event),split=first(split),
+              across(all_of(img_features),first),.groups="drop") %>% filter(complete.cases(.))
+
+  train_raw <- surv_full %>% filter(split=="train")
+  test_raw  <- surv_full %>% filter(split=="val")
+  std <- standardise_features(train_raw, test_raw, img_features)
+  surv_train <- std$train; surv_test <- std$test
+
+  if (length(img_features) > 10) {
+    img_vars <- sapply(surv_train[img_features], var, na.rm=TRUE)
+    img_features <- img_features[order(img_vars,decreasing=TRUE)[1:10]]
+  }
+  img_features <- cap_features_by_epe(img_features, sum(surv_train$event))
+
+  cat(sprintf("Train: %d patients, %d events\n", nrow(surv_train), sum(surv_train$event)))
+  coxFit_image <- fit_ridge_cox(surv_train, img_features, "Image-Only")
+  cat(sprintf("Train C-index: %.4f\n", summary(coxFit_image)$concordance[1]))
+
+  metrics_image <- compute_all_metrics_with_figures(
+    coxFit_image, surv_test %>% select(PTID,time,event,all_of(img_features)),
+    NULL, NULL, "Image-Only CNN"
+  )
+}, error=function(e) cat(sprintf("ERROR in Method 2: %s\n", e$message)))
+```
+
+---
+
+# 5. Method 3: Tabular-Only Deep NN
+
+> **Input:** `tabular_patient_level.csv`
+
+```{r method3}
+metrics_tabular <- NULL
+tryCatch({
+  out <- build_split_surv("tabular_patient_level.csv", method_name="Tabular")
+  tab_train <- out$train; tab_test <- out$test; all_cols <- out$all_cols
+  cat(sprintf("Train: %d patients, %d events\n", nrow(tab_train), sum(tab_train$event)))
+
+  sel <- select_features(tab_train, all_cols, sum(tab_train$event), "Tabular-Only")
+  coxFit_tabular <- fit_ridge_cox(tab_train, sel, "Tabular-Only")
+  cat(sprintf("Train C-index: %.4f\n", summary(coxFit_tabular)$concordance[1]))
+
+  metrics_tabular <- compute_all_metrics_with_figures(
+    coxFit_tabular, tab_test %>% select(PTID,time,event,all_of(sel)),
+    NULL, NULL, "Tabular-Only NN"
+  )
+}, error=function(e) cat(sprintf("ERROR in Method 3: %s\n", e$message)))
+```
+
+---
+
+# 6. Method 4: Concatenation Fusion
+
+> **Input:** `concat_patient_level.csv`, `latent_concat.csv`
+
+```{r method4}
+metrics_concat <- NULL
+tryCatch({
+  long_csv <- read.csv("latent_concat.csv", stringsAsFactors=FALSE)
+  long_csv$PTID <- as.character(long_csv$PTID)
+  out <- build_split_surv("concat_patient_level.csv", method_name="Concat")
+  concat_train <- out$train; concat_test <- out$test; all_cols <- out$all_cols
+
+  cat(sprintf("Train: %d patients, %d events\n", nrow(concat_train), sum(concat_train$event)))
+  sel <- select_features(concat_train, all_cols, sum(concat_train$event), "Concat")
+  coxFit_concat <- fit_ridge_cox(concat_train, sel, "Concat")
+
+  latent_vals_train <- concat_train %>% select(PTID, all_of(sel))
+  long_train <- long_csv %>%
+    filter(PTID %in% concat_train$PTID, !is.na(MMSE), !is.na(Years_bl)) %>%
+    left_join(latent_vals_train, by="PTID") %>%
+    select(PTID,Years_bl,MMSE,all_of(sel)) %>% arrange(PTID,Years_bl) %>% filter(complete.cases(.))
+
+  single_v <- long_train %>% group_by(PTID) %>% filter(n()<2) %>% pull(PTID) %>% unique()
+  long_train   <- long_train   %>% filter(!PTID %in% single_v)
+  concat_train <- concat_train %>% filter(PTID %in% intersect(concat_train$PTID, long_train$PTID))
+  long_train   <- long_train   %>% filter(PTID %in% concat_train$PTID)
+
+  lmeFit_concat <- safe_lme(as.formula(paste("MMSE ~ Years_bl +",paste(sel,collapse=" + "))), data=long_train)
+
+  uni_c_jm <- sapply(sel, function(f) tryCatch(
+    summary(coxph(as.formula(paste("Surv(time,event) ~",f)),data=concat_train))$concordance[1],
+    error=function(e) 0.5))
+  top1_concat <- sel[which.max(uni_c_jm)]
+  coxFit_concat_jm <- coxph(as.formula(paste("Surv(time,event) ~",top1_concat)),
+                            data=concat_train, x=TRUE, method="breslow")
+  lmeFit_concat_jm <- safe_lme(as.formula(paste("MMSE ~ Years_bl +",top1_concat)), data=long_train)
+  jointFit_concat  <- safe_jm(coxFit_concat_jm, lmeFit_concat_jm, method_name="Concat", seed=42)
+
+  latent_vals_test <- concat_test %>% select(PTID, all_of(sel))
+  long_test <- long_csv %>%
+    filter(PTID %in% concat_test$PTID, !is.na(MMSE), !is.na(Years_bl)) %>%
+    left_join(latent_vals_test, by="PTID") %>%
+    select(PTID,Years_bl,MMSE,all_of(sel)) %>% arrange(PTID,Years_bl) %>% filter(complete.cases(.))
+
+  metrics_concat <- compute_all_metrics_with_figures(
+    coxFit_concat, concat_test %>% select(PTID,time,event,all_of(sel)),
+    long_test, jointFit_concat, "Concatenation Fusion",
+    patient_level_data=concat_test, cox_vars_hint=top1_concat
+  )
+}, error=function(e) cat(sprintf("ERROR in Method 4: %s\n", e$message)))
+```
+
+---
+
+# 7. Method 5: No Autoencoder
+
+> **Input:** `no_ae_patient_level.csv`, `latent_no_ae.csv`
+
+```{r method5}
+metrics_noae <- NULL
+tryCatch({
+  long_csv <- read.csv("latent_no_ae.csv", stringsAsFactors=FALSE)
+  long_csv$PTID <- as.character(long_csv$PTID)
+  out <- build_split_surv("no_ae_patient_level.csv", method_name="No-AE")
+  noae_train <- out$train; noae_test <- out$test; all_cols <- out$all_cols
+
+  cat(sprintf("Train: %d patients, %d events\n", nrow(noae_train), sum(noae_train$event)))
+  sel <- select_features(noae_train, all_cols, sum(noae_train$event), "No-AE")
+  coxFit_noae <- fit_ridge_cox(noae_train, sel, "No-AE")
+
+  latent_vals_train <- noae_train %>% select(PTID, all_of(sel))
+  long_train <- long_csv %>%
+    filter(PTID %in% noae_train$PTID, !is.na(MMSE), !is.na(Years_bl)) %>%
+    left_join(latent_vals_train, by="PTID") %>%
+    select(PTID,Years_bl,MMSE,all_of(sel)) %>% arrange(PTID,Years_bl) %>% filter(complete.cases(.))
+
+  single_v   <- long_train %>% group_by(PTID) %>% filter(n()<2) %>% pull(PTID) %>% unique()
+  long_train <- long_train %>% filter(!PTID %in% single_v)
+  noae_train <- noae_train %>% filter(PTID %in% intersect(noae_train$PTID, long_train$PTID))
+  long_train <- long_train %>% filter(PTID %in% noae_train$PTID)
+
+  lmeFit_noae <- safe_lme(as.formula(paste("MMSE ~ Years_bl +",paste(sel,collapse=" + "))), data=long_train)
+
+  uni_c_jm <- sapply(sel, function(f) tryCatch(
+    summary(coxph(as.formula(paste("Surv(time,event) ~",f)),data=noae_train))$concordance[1],
+    error=function(e) 0.5))
+  top1_noae <- sel[which.max(uni_c_jm)]
+  coxFit_noae_jm <- coxph(as.formula(paste("Surv(time,event) ~",top1_noae)),
+                          data=noae_train, x=TRUE, method="breslow")
+  lmeFit_noae_jm <- safe_lme(as.formula(paste("MMSE ~ Years_bl +",top1_noae)), data=long_train)
+  jointFit_noae  <- safe_jm(coxFit_noae_jm, lmeFit_noae_jm, method_name="No-AE", seed=42)
+
+  latent_vals_test <- noae_test %>% select(PTID, all_of(sel))
+  long_test <- long_csv %>%
+    filter(PTID %in% noae_test$PTID, !is.na(MMSE), !is.na(Years_bl)) %>%
+    left_join(latent_vals_test, by="PTID") %>%
+    select(PTID,Years_bl,MMSE,all_of(sel)) %>% arrange(PTID,Years_bl) %>% filter(complete.cases(.))
+
+  metrics_noae <- compute_all_metrics_with_figures(
+    coxFit_noae, noae_test %>% select(PTID,time,event,all_of(sel)),
+    long_test, jointFit_noae, "No Autoencoder",
+    patient_level_data=noae_test, cox_vars_hint=top1_noae
+  )
+}, error=function(e) cat(sprintf("ERROR in Method 5: %s\n", e$message)))
+```
+
+---
+
+# 8. Method 6: AE-Only (No MTL)
+
+> **Input:** `ae_only_patient_level.csv`, `latent_ae_only.csv`
+> **Note:** AE-only has no survival signal in training — a lower C-index is expected.
+
+```{r method6}
+metrics_ae <- NULL
+tryCatch({
+  long_csv <- read.csv("latent_ae_only.csv", stringsAsFactors=FALSE)
+  long_csv$PTID <- as.character(long_csv$PTID)
+  out <- build_split_surv("ae_only_patient_level.csv", method_name="AE-Only")
+  ae_train <- out$train; ae_test <- out$test; all_cols <- out$all_cols
+
+  cat(sprintf("Train: %d patients, %d events\n", nrow(ae_train), sum(ae_train$event)))
+  sel <- select_features(ae_train, all_cols, sum(ae_train$event), "AE-Only")
+  coxFit_ae <- fit_ridge_cox(ae_train, sel, "AE-Only")
+
+  latent_vals_train <- ae_train %>% select(PTID, all_of(sel))
+  long_train <- long_csv %>%
+    filter(PTID %in% ae_train$PTID, !is.na(MMSE), !is.na(Years_bl)) %>%
+    left_join(latent_vals_train, by="PTID") %>%
+    select(PTID,Years_bl,MMSE,all_of(sel)) %>% arrange(PTID,Years_bl) %>% filter(complete.cases(.))
+
+  single_v <- long_train %>% group_by(PTID) %>% filter(n()<2) %>% pull(PTID) %>% unique()
+  long_train <- long_train %>% filter(!PTID %in% single_v)
+  ae_train   <- ae_train   %>% filter(PTID %in% intersect(ae_train$PTID, long_train$PTID))
+  long_train <- long_train %>% filter(PTID %in% ae_train$PTID)
+
+  lmeFit_ae <- safe_lme(as.formula(paste("MMSE ~ Years_bl +",paste(sel,collapse=" + "))), data=long_train)
+
+  uni_c_jm <- sapply(sel, function(f) tryCatch(
+    summary(coxph(as.formula(paste("Surv(time,event) ~",f)),data=ae_train))$concordance[1],
+    error=function(e) 0.5))
+  top1_ae <- sel[which.max(uni_c_jm)]
+  coxFit_ae_jm <- coxph(as.formula(paste("Surv(time,event) ~",top1_ae)),
+                        data=ae_train, x=TRUE, method="breslow")
+  lmeFit_ae_jm <- safe_lme(as.formula(paste("MMSE ~ Years_bl +",top1_ae)), data=long_train)
+  jointFit_ae  <- safe_jm(coxFit_ae_jm, lmeFit_ae_jm, method_name="AE-Only", seed=42)
+
+  latent_vals_test <- ae_test %>% select(PTID, all_of(sel))
+  long_test <- long_csv %>%
+    filter(PTID %in% ae_test$PTID, !is.na(MMSE), !is.na(Years_bl)) %>%
+    left_join(latent_vals_test, by="PTID") %>%
+    select(PTID,Years_bl,MMSE,all_of(sel)) %>% arrange(PTID,Years_bl) %>% filter(complete.cases(.))
+
+  metrics_ae <- compute_all_metrics_with_figures(
+    coxFit_ae, ae_test %>% select(PTID,time,event,all_of(sel)),
+    long_test, jointFit_ae, "AE-Only (No MTL)",
+    patient_level_data=ae_test, cox_vars_hint=top1_ae
+  )
+}, error=function(e) cat(sprintf("ERROR in Method 6: %s\n", e$message)))
+```
+
+---
+
+# 9. Combined Results Table
+
+```{r combined-results}
+all_results_file <- "thesis_figures/ALL_METHODS_RESULTS.csv"
+if (file.exists(all_results_file)) {
+  all_res <- read.csv(all_results_file, stringsAsFactors=FALSE)
+  display_cols <- c("name","n_patients","n_events",
+                    "cindex","cindex_ci_lower","cindex_ci_upper",
+                    "brier_3yr","calibration_slope",
+                    "rmst_diff","rmst_pval","mae_time","jm_dynamic_auc")
+  display_cols <- intersect(display_cols, names(all_res))
+  knitr::kable(all_res[, display_cols],
+               digits=3,
+               caption="All Methods — Test Set Performance",
+               row.names=FALSE)
+} else {
+  cat("Results file not yet created. Run all methods above first.\n")
+}
+```
+
+---
+
+*Figures saved to: `thesis_figures/<method_name>/`*
+*Combined results: `thesis_figures/ALL_METHODS_RESULTS.csv`*
